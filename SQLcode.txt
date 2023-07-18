@@ -1,0 +1,261 @@
+--CREATE DETAILED REPORT TABLE--
+
+CREATE TABLE detailed_report (
+    rental_id INT,
+    store_id SMALLINT,
+    film_title VARCHAR(255),
+    film_genre VARCHAR(50),
+    rental_date DATE
+);
+
+--POPULATE DETAILED REPORT TABLE--
+INSERT INTO detailed_report (
+    rental_id,
+    store_id,
+    film_title,
+    film_genre,
+    rental_date
+)
+SELECT
+    r.rental_id,
+    i.store_id,     
+    f.title as film_title,
+    cat.name as film_genre,
+    r.rental_date
+FROM rental AS r
+INNER JOIN inventory AS i ON i.inventory_id = r.inventory_id
+INNER JOIN film AS f ON f.film_id = i.film_id
+INNER JOIN film_category as fcat ON fcat.film_id = f.film_id
+INNER JOIN category as cat ON cat.category_id = fcat.category_id;
+
+
+
+
+
+--CREATE FUNCTIONS TO TRANSFORM MONTH, YEAR FOR PROJECT--
+
+
+--RETURN MONTH AS INT--
+CREATE OR REPLACE FUNCTION get_month_int(rental_date DATE)
+RETURNS INT
+LANGUAGE plpgsql
+AS $$
+DECLARE sales_month INT;
+BEGIN
+SELECT EXTRACT(MONTH FROM rental_date)
+INTO sales_month;
+RETURN sales_month;
+END; $$;
+
+--RETURN MONTH AS STRING--
+CREATE OR REPLACE FUNCTION get_month_string(rental_date DATE)
+RETURNS TEXT
+LANGUAGE plpgsql
+AS $$
+DECLARE month_string TEXT;
+BEGIN 
+SELECT TO_CHAR (rental_date, 'Month')
+INTO month_string;
+RETURN month_string;
+END; $$;
+
+--RETURN YEAR AS INT--
+CREATE OR REPLACE FUNCTION get_year(rental_date DATE)
+RETURNS INT 
+LANGUAGE plpgsql
+AS $$
+DECLARE sales_year INT;
+BEGIN
+SELECT EXTRACT (YEAR from rental_date)
+INTO sales_year;
+RETURN sales_year;
+END; $$;
+
+
+
+
+
+
+--CREATE RENTALS BY MONTH TABLE--
+--This table serves as data verification for summary report table--
+CREATE TABLE rentals_by_month(
+    rental_month VARCHAR(25),
+    rental_year INT,
+    store_id SMALLINT,
+    rental_id INT
+);
+
+INSERT INTO rentals_by_month (
+    rental_month,
+    rental_year,
+    store_id,
+    rental_id
+)
+SELECT 
+    get_month_string(rental_date) AS rental_month,
+    get_year(rental_date) AS rental_year,
+    store_id,
+    rental_id
+FROM detailed_report;
+
+--DATA VERIFICATION QUERY TOTALS SHOULD BE SUM OF BOTH STORES IN SUMMARY REPORT--
+SELECT rental_month,
+    COUNT(rental_id) AS total_rentals
+    FROM rentals_by_month
+    GROUP BY rental_month
+    ORDER BY total_rentals;
+
+
+
+
+--CREATE SUMMARY REPORT TABLE--
+
+CREATE TABLE summary_report (
+    rental_month VARCHAR(25),
+    rental_year INT,
+    total_rentals BIGINT,
+    store_id SMALLINT
+);
+
+INSERT INTO summary_report(
+SELECT 
+    get_month_string(rental_date) AS rental_month,
+    get_year(rental_date) AS rental_year,
+    COUNT(rental_id) AS total_rentals, 
+    store_id
+    FROM detailed_report
+    WHERE store_id =1
+    GROUP BY store_id, rental_month, rental_year)
+UNION ALL ((
+SELECT
+    get_month_string(rental_date) AS rental_month, 
+    get_year(rental_date) AS rental_year,
+    COUNT(rental_id) AS total_rentals, 
+    store_id
+    FROM detailed_report
+    WHERE store_id =2
+    GROUP BY store_id, rental_month, rental_year
+    ))
+    ORDER BY rental_year, rental_month, store_id;
+
+
+
+
+
+
+
+
+
+--TRIGGER CREATION BETWEEN 2 TABLES--
+--this updates the summary table when data is added to the detailed table--
+
+CREATE OR REPLACE FUNCTION summary_updater_function()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    DELETE FROM summary_report;
+    INSERT INTO summary_report
+(SELECT 
+    get_month_string(rental_date) AS rental_month,
+    get_year(rental_date) AS rental_year,
+    COUNT(rental_id) AS total_rentals, 
+    store_id
+FROM detailed_report
+WHERE store_id =1
+GROUP BY store_id, rental_month, rental_year)
+UNION ALL ((
+SELECT
+    get_month_string(rental_date) AS rental_month, 
+    get_year(rental_date) AS rental_year,
+    COUNT(rental_id) AS total_rentals, 
+    store_id
+FROM detailed_report
+WHERE store_id =2
+GROUP BY store_id, rental_month, rental_year
+))
+ORDER BY rental_year, rental_month, store_id;
+
+RETURN NEW;
+END; $$;
+
+CREATE TRIGGER summary_updater_trigger
+AFTER INSERT OR UPDATE OR DELETE ON detailed_report
+FOR EACH STATEMENT
+EXECUTE PROCEDURE summary_updater_function();
+
+
+
+
+--VERIFYING TRIGGER ON DETAILED_REPORT--
+SELECT COUNT(*) FROM detailed_report
+--RESULT IS 16044--
+SELECT COUNT(*) FROM summary_report
+--RESULT IS 10--
+
+INSERT INTO detailed_report VALUES (20000, 2, 'FAKE FILM', 'FAKE GENRE', '01-01-1901')
+
+SELECT COUNT(*) FROM detailed_report
+--RESULT IS 16045--
+SELECT COUNT(*) FROM summary_report
+--RESULT IS 11--
+
+DELETE FROM detailed_report WHERE rental_id = 20000 RETURNING *;
+--this will show exact row that is deleted--
+
+SELECT COUNT(*) FROM detailed_report
+--RESULT IS 16044--
+SELECT COUNT(*) FROM summary_report
+--RESULT IS 10--
+--back to normal, trigger works--
+
+
+
+
+--STORED PROCEDURE TO REFRESH REPORTS--
+
+CREATE OR REPLACE PROCEDURE report_refresher()
+LANGUAGE plpgsql
+AS $$
+BEGIN
+
+    DELETE FROM detailed_report;
+    DELETE FROM summary_report;
+    INSERT INTO detailed_report (
+    SELECT
+    r.rental_id,
+    i.store_id,     
+    f.title as film_title,
+    cat.name as film_genre,
+    r.rental_date
+FROM rental AS r
+INNER JOIN inventory AS i ON i.inventory_id = r.inventory_id
+INNER JOIN film AS f ON f.film_id = i.film_id
+INNER JOIN film_category as fcat ON fcat.film_id = f.film_id
+INNER JOIN category as cat ON cat.category_id = fcat.category_id);
+    INSERT INTO summary_report (
+    SELECT 
+    get_month_string(rental_date) AS rental_month,
+    get_year(rental_date) AS rental_year,
+    COUNT(rental_id) AS total_rentals, 
+    store_id
+FROM detailed_report
+WHERE store_id =1
+GROUP BY store_id, rental_month, rental_year)
+UNION ALL ((
+SELECT
+    get_month_string(rental_date) AS rental_month, 
+    get_year(rental_date) AS rental_year,
+    COUNT(rental_id) AS total_rentals, 
+    store_id
+FROM detailed_report
+WHERE store_id =2
+GROUP BY store_id, rental_month, rental_year
+))
+ORDER BY rental_year, rental_month, store_id;
+
+RETURN;
+END; $$;
+
+--TO CALL PROCEDURE--
+CALL report_refresher();
